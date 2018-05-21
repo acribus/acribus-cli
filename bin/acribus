@@ -1,0 +1,276 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const readlineSync = require('readline-sync');
+const execSync = require('child_process').execSync;
+const spawn = require('child_process').spawn;
+
+const request = require('request-promise');
+const handlebars = require('handlebars');
+const inquirer = require('inquirer');
+const chalk = require('chalk');
+
+// variables
+const cwd = process.cwd();
+const args = [...process.argv].slice(2);
+const scaffold = process.mainModule.filename.replace(/\/[^\/]+?$/, '/../scaffold');
+
+// output
+const output = {
+  generated: [],
+  modified: [],
+  notice: []
+};
+
+function capitalize(str) {
+  return str[0].toUpperCase() + str.substr(1);
+}
+
+function log(args) {
+  if (Array.isArray(args)) {
+    console.log('');
+    for (const str of args) {
+      console.log(str);
+    }
+  } else {
+    console.log('\n' + args);
+  }
+}
+
+function error(msg) {
+  log(chalk.red.bold('Error: ') + msg + '\n');
+  process.exit(1);
+}
+
+function warning(msg) {
+  log(chalk.yellow.bold('Warning: ') + msg);
+}
+
+function title(msg) {
+  return chalk.green('* ') + chalk.bold(msg);
+}
+
+function getRepoUrl(url, type = 'github') {
+  switch (type) {
+    case 'github':
+      return {
+        ssh: `git@github.com:${url}`,
+        http: `https://github.com/${url}`
+      }
+  }
+}
+
+async function run(cmd, args) {
+  return new Promise(resolve => {
+    const res = spawn(cmd, args, { stdio: 'inherit' });
+    res.on('close', code => resolve(code));
+  })
+}
+
+function getCurrentResources() {
+  return fs
+    .readdirSync(`${cwd}/src/store/modules/`)
+    .map(res => res.replace('.js', ''))
+    .filter(res => res !== 'menu')
+}
+
+async function generateFile(scaffold, dest, vars, defaultOverride = false) {
+  const actualDest = `${cwd}/${dest}`;
+  if (fs.existsSync(actualDest) && !defaultOverride) {
+    const queryAns = await inquirer.prompt([{
+      type: 'list',
+      name: 'str',
+      message: `File '${dest}' exists, override?`,
+      choices: ['Yes', 'No'],
+      default: 'No'
+    }]);
+    if (queryAns.str === 'No') {
+      return null;
+    }
+  }
+  const source = fs.readFileSync(scaffold).toString();
+  const template = handlebars.compile(source);
+  fs.writeFileSync(actualDest, template(vars));
+  return dest;
+}
+
+async function doInit([
+  url = error('Must specify a template repo!'),
+  name = error('Must specify a project name!')
+]) {
+  const path = `/tmp/acribus-cli-cache/${url.split('/').pop()}`;
+  if (fs.existsSync(path)) {
+    execSync(`cd ${path} && git pull origin develop`);
+  } else {
+    await run('git', ['clone', getRepoUrl(url).ssh, path, '--depth', '1']);
+  }
+  await run('vue', ['init', path, name]);
+}
+
+function modifyStoreIndex(name) {
+  const dest = 'src/store/index.js';
+  const actualDest = `${cwd}/${dest}`;
+  let code = fs.readFileSync(actualDest).toString();
+  if (new RegExp(`import ${name}\\s`, 'im').test(code)) {
+    warning(`Resource '${name}' has already showed up in 'src/store/index.js', will not be added twice.`);
+    return null;
+  }
+  let re = null;
+  let matched = null;
+  // deal with import
+  re = /import [0-9a-z_]+ from\s*(['"])[^'"]+['"](;?)(\r?\n)+Vue/im;
+  matched = code.match(re);
+  const quote = matched[1];
+  const semi = matched[2];
+  const lineEnding = matched[3];
+  const insertedImport = `${lineEnding}import ${name} from ${quote}./modules/${name}${quote}${semi}`;
+  // deal with module name
+  re = /(,?)(\r?\n)+(\s*)\}(\r?\n)+\}\)/im;
+  matched = code.match(re);
+  const comma = matched[1];
+  const indent = matched[3];
+  const insertedModule = `${comma ? '' : ','}${lineEnding}${indent}${indent}${name}${comma}`;
+  code = code.replace(/(?=(\r?\n)+Vue\.use\(Vuex\))/im, insertedImport);
+  code = code.replace(/(?=(\r?\n)+\s*\}(\r?\n)+\}\))/im, insertedModule);
+  fs.writeFileSync(actualDest, code);
+  return dest;
+}
+
+async function addResource(name) {
+  const vars = { 'resource_name': name };
+  let files;
+  files =[
+    await generateFile(`${scaffold}/api.js`, `src/api/${name}.js`, vars),
+    await generateFile(`${scaffold}/store.js`, `src/store/modules/${name}.js`, vars)
+  ].filter(t => t !== null);
+  output.generated.push(...files);
+  files = [
+    modifyStoreIndex(name)
+  ].filter(t => t !== null);
+  output.modified.push(...files);
+}
+
+function autoImportForRoute(name) {
+  const capName = capitalize(name);
+  const dest = 'src/router/index.js';
+  const actualDest = `${cwd}/${dest}`;
+  let code = fs.readFileSync(actualDest).toString();
+  if (new RegExp(`import ${name}\\s`, 'im').test(code)) {
+    warning(`View '${name}' has already showed up in 'src/router/index.js', will not be added twice.`);
+    return null;
+  }
+  let re = null;
+  let matched = null;
+  re = /import .+ from (['"]).+(;?)(\r?\n)/im;
+  matched = code.match(re);
+  const quote = matched[1];
+  const semi = matched[2];
+  const lineEnding = matched[3];
+  const insertedView = `${lineEnding}import ${capName} from ${quote}../views/${name}.js${quote}${semi}`;
+  code = code.replace(/(?=\n+Vue\.use)/im, insertedView);
+  fs.writeFileSync(actualDest, code);
+  warning(`You need to edit route config by yourself, usually the config for view '${name}' can be like this:\n\n{
+  path: '[/prefix]/${name}/:view/:from',
+  meta: {
+    title: '${capName}'
+  },
+  component: ${capName}\n}`)
+  return dest;
+}
+
+async function addView(name) {
+  if (fs.existsSync(`${cwd}/src/views/${name}.js`)) {
+    const queryAns = await inquirer.prompt([{
+      type: 'list',
+      name: 'override',
+      message: `File 'src/views/${name}.js' exists, override?`,
+      choices: ['Yes', 'No'],
+      default: 'No'
+    }]);
+    if (queryAns.override === 'No') {
+      return null;
+    }
+  }
+  const resources = getCurrentResources();
+  const queryAns = await inquirer.prompt([{
+    type: 'list',
+    name: 'resourceName',
+    message: `Pick a main resource for view '${name}':`,
+    choices: [...resources, { name: 'Create a new resource', value: null }]
+  }, {
+    type: 'input',
+    name: 'resourceName',
+    message: 'Pick a resource name:',
+    when: ans => !ans.resourceName
+  }]);
+  const resourceName = queryAns.resourceName;
+  if (!resources.includes(resourceName)) {
+    await doAdd(['resource', resourceName]);
+  }
+  const vars = { 'resource_name': resourceName };
+  let files = [
+    await generateFile(`${scaffold}/view.js`, `src/views/${name}.js`, vars, true)
+  ].filter(t => t !== null);
+  output.generated.push(...files);
+  files = [
+    autoImportForRoute(name)
+  ].filter(t => t !== null);
+  output.modified.push(...files);
+  output.notice.push('src/store/module/menu.js', 'src/router/index.js');
+}
+
+/**
+ * Param 'name' can be assigned because when we adding
+ * a view, we might together add a resource.
+ * Otherwise, we ask user to input a name.
+ */
+async function doAdd([
+  type = error('Must specify a type!'),
+  name = null
+]) {
+  // TODO: support using it at sub directory
+  if (!fs.existsSync('package.json')) {
+    error('Command \'add\' should be used at a project\'s root directory!')
+  }
+  if (!name) {
+    const queryAns = await inquirer.prompt([{
+      type: 'input',
+      name: 'name',
+      message: `Pick a ${type} name:`
+    }]);
+    name = queryAns.name;
+  }
+  if (!name) {
+    error(`Aborting due to empty ${type} name.`);
+  }
+  switch (type) {
+    case 'resource': await addResource(name); break;
+    case 'view': await addView(name); break;
+  }
+}
+
+(async function () {
+  switch (args[0]) {
+    case 'init': await doInit(args.slice(1)); break;
+    case 'add': await doAdd(args.slice(1)); break;
+    default: {
+      log([
+        'Usage:',
+        '  acribus init user/repo project-name',
+        '  acribus add resource',
+        '  acribus add view',
+        ''
+      ]);
+      process.exit(1);
+    }
+  }
+  log([
+    title('Generated files:'),
+    `    ${output.generated.join('\n    ') || 'None'}`,
+    title('Modified files:'),
+    `    ${output.modified.join('\n    ') || 'None'}`,
+    title('Maybe you should notice or edit these files:'),
+    `    ${output.notice.join('\n    ') || 'None'}`,
+    ''
+  ]);
+})();
