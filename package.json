@@ -6,7 +6,7 @@
     "Xianwen Zeng <xianwen.zeng@shopee.com>"
   ],
   "preferGlobal": true,
-  "private": true,
+  "private": false,
   "bin": {
     "acribus": "bin/acribus"
   },
