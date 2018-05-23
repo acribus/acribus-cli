@@ -1,6 +1,6 @@
 {
   "name": "acribus-cli",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "A cli tool for acribus.",
   "contributors": [
     "Xianwen Zeng <xianwen.zeng@shopee.com>"
